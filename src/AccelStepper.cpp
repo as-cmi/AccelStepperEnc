@@ -5,6 +5,28 @@
 
 #include "AccelStepper.h"
 
+//#define DEBUG_DEV
+#ifdef RASPBERRYPI_PICO
+    #include "pico/stdlib.h"
+    #include "math.h"
+    #include "hardware/timer.h"
+    #include "hardware/gpio.h"
+
+    #define HIGH true
+    #define LOW false
+    #define min(a,b) ((a)<(b)?(a):(b))
+    #define max(a,b) ((a)>(b)?(a):(b))
+    #define abs(x) ((x)>0?(x):-(x))
+    #define constrain(amt,low,high) ((amt)<(low)?(low):((amt)>(high)?(high):(amt)))
+    #define micros() time_us_32()
+    #define delayMicroseconds(a) busy_wait_us_32(a)
+    #define digitalWrite(a,b) gpio_put(a,b)
+    #define OUTPUT GPIO_OUT
+    #define INPUT GPIO_IN
+    #define pinMode(a,b) gpio_set_function(a,GPIO_FUNC_SIO);gpio_set_dir(a,b)
+
+#endif
+
 #if 0
 // Some debugging assistance
 void dump(uint8_t* p, int l)
@@ -25,9 +47,15 @@ void AccelStepper::moveTo(long absolute)
     if (_targetPos != absolute)
     {
 	_targetPos = absolute;
+		_encoderTargetPos = encoderPositionForMotor(_targetPos);
 	computeNewSpeed();
 	// compute new n?
     }
+}
+
+float AccelStepper::encoderPositionForMotor(long motorPos)
+{
+	return (float)motorPos / _motorToEncoderRatio;
 }
 
 void AccelStepper::move(long relative)
@@ -38,13 +66,13 @@ void AccelStepper::move(long relative)
 // Implements steps according to the current step interval
 // You must call this at least once per step
 // returns true if a step occurred
-boolean AccelStepper::runSpeed()
+bool AccelStepper::runSpeed()
 {
     // Dont do anything unless we actually have a step interval
     if (!_stepInterval)
 	return false;
 
-    unsigned long time = micros();   
+    unsigned long time = micros();
     if (time - _lastStepTime >= _stepInterval)
     {
 	if (_direction == DIRECTION_CW)
@@ -54,7 +82,7 @@ boolean AccelStepper::runSpeed()
 	}
 	else
 	{
-	    // Anticlockwise  
+	    // Anticlockwise
 	    _currentPos -= 1;
 	}
 	step(_currentPos);
@@ -155,7 +183,7 @@ void AccelStepper::computeNewSpeed()
     {
 	// Subsequent step. Works for accel (n is +_ve) and decel (n is -ve).
 	_cn = _cn - ((2.0 * _cn) / ((4.0 * _n) + 1)); // Equation 13
-	_cn = max(_cn, _cmin); 
+	_cn = max(_cn, _cmin);
     }
     _n++;
     _stepInterval = _cn;
@@ -180,11 +208,84 @@ void AccelStepper::computeNewSpeed()
 // You must call this at least once per step, preferably in your main loop
 // If the motor is in the desired position, the cost is very small
 // returns true if the motor is still running to the target position.
-boolean AccelStepper::run()
+bool AccelStepper::run()
 {
     if (runSpeed())
+	{
 	computeNewSpeed();
+	}
     return _speed != 0.0 || distanceToGo() != 0;
+}
+
+// Look at motor position vs actual position, and correct motor position if necessary.
+float AccelStepper::computeDeviation()
+{
+	float expectedEncPos = encoderPositionForMotor(_currentPos);
+	float actualEncPos = readEnc();
+	float deviation = actualEncPos - expectedEncPos;
+
+	if (deviation > maxDeviation) maxDeviation = deviation;
+	else if (deviation < minDeviation) minDeviation = deviation;
+
+#ifdef DEBUG_DEV
+    #ifdef RASPBERRYPI_PICO
+        printf("dest=%3f pos=%3f err=%3f min=%3f max=%3f \r\n", expectedEncPos, actualEncPos, deviation, minDeviation, maxDeviation);
+    #else
+        Serial.print("expectedEncPos: ");
+        Serial.println(expectedEncPos);
+        Serial.print("actualEncPos: ");
+        Serial.println(actualEncPos);
+        Serial.print("deviation: ");
+        Serial.print(deviation);
+        Serial.print(" (min: ");
+        Serial.print(minDeviation);
+        Serial.print(", max: ");
+        Serial.print(maxDeviation);
+        Serial.println(")");
+        Serial.println("~~~~~");
+    #endif
+#endif
+	return deviation;
+}
+
+float AccelStepper::correctDeviation()
+{
+	float deviation = computeDeviation();
+	if (abs(deviation) > acceptableDeviation)
+	{
+#ifdef DEBUG
+    Serial.print("CORRECTING DEVIATION!");
+    Serial.println(deviation);
+#endif
+		synchroniseMotorWithEncoder();
+	}
+	else
+	{
+#ifdef DEBUG
+    //Serial.print("Deviation is not enough to fix: ");
+    //Serial.println(deviation);
+#endif
+	}
+	return deviation;
+}
+
+/*
+Resets the motor position to reflect the actual position (as got via encoder)
+*/
+void AccelStepper::synchroniseMotorWithEncoder()
+{
+#ifdef DEBUG
+    Serial.print("CurrentPos was: ");
+    Serial.print(_currentPos);
+#endif
+	_currentPos = readEnc() * _motorToEncoderRatio;
+#ifdef DEBUG
+	Serial.print(", is now set to: ");
+	Serial.println(_currentPos);
+#endif
+	_targetPos = _currentPos;
+
+	//setSpeed(0);
 }
 
 AccelStepper::AccelStepper(uint8_t interface, uint8_t pin1, uint8_t pin2, uint8_t pin3, uint8_t pin4, bool enable)
@@ -205,7 +306,7 @@ AccelStepper::AccelStepper(uint8_t interface, uint8_t pin1, uint8_t pin2, uint8_
     _pin[2] = pin3;
     _pin[3] = pin4;
     _enableInverted = false;
-    
+
     // NEW
     _n = 0;
     _c0 = 0.0;
@@ -327,26 +428,26 @@ void AccelStepper::step(long step)
 	case DRIVER:
 	    step1(step);
 	    break;
-    
+
 	case FULL2WIRE:
 	    step2(step);
 	    break;
-    
+
 	case FULL3WIRE:
 	    step3(step);
-	    break;  
+	    break;
 
 	case FULL4WIRE:
 	    step4(step);
-	    break;  
+	    break;
 
 	case HALF3WIRE:
 	    step6(step);
-	    break;  
-		
+	    break;
+
 	case HALF4WIRE:
 	    step8(step);
-	    break;  
+	    break;
     }
 }
 
@@ -386,7 +487,7 @@ void AccelStepper::step1(long step)
     // _pin[0] is step, _pin[1] is direction
     setOutputPins(_direction ? 0b10 : 0b00); // Set direction first else get rogue pulses
     setOutputPins(_direction ? 0b11 : 0b01); // step HIGH
-    // Caution 200ns setup time 
+    // Caution 200ns setup time
     // Delay the minimum allowed pulse width
     delayMicroseconds(_minPulseWidth);
     setOutputPins(_direction ? 0b10 : 0b00); // step LOW
@@ -435,7 +536,7 @@ void AccelStepper::step3(long step)
 	case 2:    //010
 	    setOutputPins(0b010);
 	    break;
-	    
+
     }
 }
 
@@ -474,27 +575,27 @@ void AccelStepper::step6(long step)
 	case 0:    // 100
 	    setOutputPins(0b100);
             break;
-	    
+
         case 1:    // 101
 	    setOutputPins(0b101);
             break;
-	    
+
 	case 2:    // 001
 	    setOutputPins(0b001);
             break;
-	    
+
         case 3:    // 011
 	    setOutputPins(0b011);
             break;
-	    
+
 	case 4:    // 010
 	    setOutputPins(0b010);
             break;
-	    
+
 	case 5:    // 011
 	    setOutputPins(0b110);
             break;
-	    
+
     }
 }
 
@@ -508,40 +609,40 @@ void AccelStepper::step8(long step)
 	case 0:    // 1000
 	    setOutputPins(0b0001);
             break;
-	    
+
         case 1:    // 1010
 	    setOutputPins(0b0101);
             break;
-	    
+
 	case 2:    // 0010
 	    setOutputPins(0b0100);
             break;
-	    
+
         case 3:    // 0110
 	    setOutputPins(0b0110);
             break;
-	    
+
 	case 4:    // 0100
 	    setOutputPins(0b0010);
             break;
-	    
+
         case 5:    //0101
 	    setOutputPins(0b1010);
             break;
-	    
+
 	case 6:    // 0001
 	    setOutputPins(0b1000);
             break;
-	    
+
         case 7:    //1001
 	    setOutputPins(0b1001);
             break;
     }
 }
-    
+
 // Prevents power consumption on the outputs
 void    AccelStepper::disableOutputs()
-{   
+{
     if (! _interface) return;
 
     setOutputPins(0); // Handles inversion automatically
@@ -554,7 +655,7 @@ void    AccelStepper::disableOutputs()
 
 void    AccelStepper::enableOutputs()
 {
-    if (! _interface) 
+    if (! _interface)
 	return;
 
     pinMode(_pin[0], OUTPUT);
@@ -601,7 +702,7 @@ void AccelStepper::setPinsInverted(bool directionInvert, bool stepInvert, bool e
 }
 
 void AccelStepper::setPinsInverted(bool pin1Invert, bool pin2Invert, bool pin3Invert, bool pin4Invert, bool enableInvert)
-{    
+{
     _pinInverted[0] = pin1Invert;
     _pinInverted[1] = pin2Invert;
     _pinInverted[2] = pin3Invert;
@@ -616,7 +717,7 @@ void AccelStepper::runToPosition()
 	YIELD; // Let system housekeeping occur
 }
 
-boolean AccelStepper::runSpeedToPosition()
+bool AccelStepper::runSpeedToPosition()
 {
     if (_targetPos == _currentPos)
 	return false;
@@ -637,7 +738,7 @@ void AccelStepper::runToNewPosition(long position)
 void AccelStepper::stop()
 {
     if (_speed != 0.0)
-    {    
+    {
 	long stepsToStop = (long)((_speed * _speed) / (2.0 * _acceleration)) + 1; // Equation 16 (+integer rounding)
 	if (_speed > 0)
 	    move(stepsToStop);
@@ -650,3 +751,37 @@ bool AccelStepper::isRunning()
 {
     return !(_speed == 0.0 && _targetPos == _currentPos);
 }
+
+
+#ifdef RASPBERRYPI_PICO
+
+void AccelStepper::addEncoder(void(*init)(void), int32_t(*get)(void), float ratio, float maxAcceptableErr)
+{
+	acceptableDeviation = maxAcceptableErr;
+    _motorToEncoderRatio = ratio;
+	init();
+    readEnc = get;
+}
+
+#else
+
+void AccelStepper::addEncoder(Encoder *enc, float ratio)
+{
+	_motorToEncoderRatio = ratio;
+	_enc = enc;
+	writeEnc(0);
+}
+Encoder* AccelStepper::getEncoder()
+{
+	return _enc;
+}
+long AccelStepper::readEnc()
+{
+	return _enc->read();
+}
+void AccelStepper::writeEnc(long value)
+{
+	_enc->write(value);
+}
+
+#endif
